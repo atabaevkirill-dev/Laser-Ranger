@@ -141,18 +141,6 @@ class LaserRangefinderApp(QMainWindow):
         self.use_onvif = self.config.getboolean('CAMERA', 'enable_onvif', fallback=False)
         self.use_pelco_d = self.config.getboolean('CAMERA', 'use_pelco_d', fallback=False)
         
-        # Инициализация контроллера поворотки (новый функционал)
-        self.pan_tilt_controller = None
-        self.use_pan_tilt = self.config.getboolean('PAN_TILT', 'use_pan_tilt', fallback=False)
-        if self.use_pan_tilt and PAN_TILT_AVAILABLE:
-            pan_tilt_host = self.config.get('PAN_TILT', 'host', fallback='192.168.1.115')
-            pan_tilt_port = self.config.getint('PAN_TILT', 'port', fallback=9760)
-            self.pan_tilt_controller = PanTiltController(pan_tilt_host, pan_tilt_port)
-            if self.pan_tilt_controller.connect():
-                print(f"Successfully connected to pan-tilt controller at {pan_tilt_host}:{pan_tilt_port}")
-            else:
-                print(f"Failed to connect to pan-tilt controller at {pan_tilt_host}:{pan_tilt_port}")
-        
         # Инициализация контроллера камеры
         if self.use_onvif and ONVIF_AVAILABLE:
             onvif_ip = self.config.get('CAMERA', 'onvif_ip', fallback='192.168.1.68')
@@ -248,73 +236,43 @@ class LaserRangefinderApp(QMainWindow):
 
     def _build_camera_controls_group(self):
         """Создание группы элементов управления камерой."""
-        grp = QGroupBox("Pan-Tilt Controls"); lay = QVBoxLayout(grp)
+        grp = QGroupBox("Camera Controls"); lay = QVBoxLayout(grp)
         
-        # Создаем кнопки управления повороткой (новый контроллер)
-        if PAN_TILT_AVAILABLE and self.use_pan_tilt:
-            pan_tilt_layout = QGridLayout()
-            
-            # Диагональные кнопки для нового контроллера
-            self.pan_tilt_diag_up_left_btn = QPushButton("↖")
-            self.pan_tilt_diag_up_left_btn.pressed.connect(lambda: self._pan_tilt_move_diagonal(-1, 1))
-            self.pan_tilt_diag_up_left_btn.released.connect(self._pan_tilt_stop)  # Останавливает обе оси
-            pan_tilt_layout.addWidget(self.pan_tilt_diag_up_left_btn, 0, 0)
-            
-            self.pan_tilt_up_btn = QPushButton("↑")
-            self.pan_tilt_up_btn.pressed.connect(lambda: self._pan_tilt_move_tilt(1))
-            self.pan_tilt_up_btn.released.connect(self._pan_tilt_stop_tilt)  # Останавливает только tilt
-            pan_tilt_layout.addWidget(self.pan_tilt_up_btn, 0, 1)
-            
-            self.pan_tilt_diag_up_right_btn = QPushButton("↗")
-            self.pan_tilt_diag_up_right_btn.pressed.connect(lambda: self._pan_tilt_move_diagonal(1, 1))
-            self.pan_tilt_diag_up_right_btn.released.connect(self._pan_tilt_stop)  # Останавливает обе оси
-            pan_tilt_layout.addWidget(self.pan_tilt_diag_up_right_btn, 0, 2)
-            
-            self.pan_tilt_left_btn = QPushButton("←")
-            self.pan_tilt_left_btn.pressed.connect(lambda: self._pan_tilt_move_pan(-1))
-            self.pan_tilt_left_btn.released.connect(self._pan_tilt_stop_pan)  # Останавливает только pan
-            pan_tilt_layout.addWidget(self.pan_tilt_left_btn, 1, 0)
-            
-            # Меняем местами кнопку "Стоп" и "Домой"
-            self.pan_tilt_stop_btn = QPushButton("⏹ Stop")
-            self.pan_tilt_stop_btn.clicked.connect(self._pan_tilt_stop)  # Останавливает обе оси
-            pan_tilt_layout.addWidget(self.pan_tilt_stop_btn, 1, 1)
-            
-            self.pan_tilt_right_btn = QPushButton("→")
-            self.pan_tilt_right_btn.pressed.connect(lambda: self._pan_tilt_move_pan(1))
-            self.pan_tilt_right_btn.released.connect(self._pan_tilt_stop_pan)  # Останавливает только pan
-            pan_tilt_layout.addWidget(self.pan_tilt_right_btn, 1, 2)
-            
-            self.pan_tilt_diag_down_left_btn = QPushButton("↙")
-            self.pan_tilt_diag_down_left_btn.pressed.connect(lambda: self._pan_tilt_move_diagonal(-1, -1))
-            self.pan_tilt_diag_down_left_btn.released.connect(self._pan_tilt_stop)  # Останавливает обе оси
-            pan_tilt_layout.addWidget(self.pan_tilt_diag_down_left_btn, 2, 0)
-            
-            self.pan_tilt_down_btn = QPushButton("↓")
-            self.pan_tilt_down_btn.pressed.connect(lambda: self._pan_tilt_move_tilt(-1))
-            self.pan_tilt_down_btn.released.connect(self._pan_tilt_stop_tilt)  # Останавливает только tilt
-            pan_tilt_layout.addWidget(self.pan_tilt_down_btn, 2, 1)
-            
-            self.pan_tilt_diag_down_right_btn = QPushButton("↘")
-            self.pan_tilt_diag_down_right_btn.pressed.connect(lambda: self._pan_tilt_move_diagonal(1, -1))
-            self.pan_tilt_diag_down_right_btn.released.connect(self._pan_tilt_stop)  # Останавливает обе оси
-            pan_tilt_layout.addWidget(self.pan_tilt_diag_down_right_btn, 2, 2)
-            
-            # Кнопка "Домой" теперь на месте кнопки "Стоп"
-            self.pan_tilt_home_btn = QPushButton("🏠 Home")
-            self.pan_tilt_home_btn.clicked.connect(self._pan_tilt_go_home)
-            pan_tilt_layout.addWidget(self.pan_tilt_home_btn, 3, 0, 1, 3)
-            
-            # Кнопка самодиагностики
-            self.pan_tilt_diag_btn = QPushButton("🔧 Self-Test")
-            self.pan_tilt_diag_btn.clicked.connect(self._pan_tilt_start_self_test)
-            pan_tilt_layout.addWidget(self.pan_tilt_diag_btn, 4, 0, 1, 3)
-            
-            # Добавляем метку для позиций
-            self.pan_tilt_pos_label = QLabel("Pan: --°, Tilt: --°")
-            pan_tilt_layout.addWidget(self.pan_tilt_pos_label, 5, 0, 1, 3)
-            
-            lay.addLayout(pan_tilt_layout)
+        # Создаем кнопки управления камерой
+        ctrl_layout = QGridLayout()
+        
+        # Кнопки для управления зумом
+        self.zoom_in_btn = QPushButton("🔍 + Zoom In")
+        self.zoom_in_btn.clicked.connect(self._zoom_in)
+        ctrl_layout.addWidget(self.zoom_in_btn, 0, 0)
+
+        self.zoom_out_btn = QPushButton("🔍 - Zoom Out")
+        self.zoom_out_btn.clicked.connect(self._zoom_out)
+        ctrl_layout.addWidget(self.zoom_out_btn, 0, 1)
+        
+        # Кнопки для управления поворотом
+        self.up_btn = QPushButton("⬆ Up")
+        self.up_btn.clicked.connect(self._move_up)
+        ctrl_layout.addWidget(self.up_btn, 1, 1)
+        
+        self.down_btn = QPushButton("⬇ Down")
+        self.down_btn.clicked.connect(self._move_down)
+        ctrl_layout.addWidget(self.down_btn, 3, 1)
+        
+        self.left_btn = QPushButton("⬅ Left")
+        self.left_btn.clicked.connect(self._move_left)
+        ctrl_layout.addWidget(self.left_btn, 2, 0)
+        
+        self.right_btn = QPushButton("➡ Right")
+        self.right_btn.clicked.connect(self._move_right)
+        ctrl_layout.addWidget(self.right_btn, 2, 2)
+        
+        # Кнопка остановки движения
+        self.stop_btn = QPushButton("⏹ Stop")
+        self.stop_btn.clicked.connect(self._stop_movement)
+        ctrl_layout.addWidget(self.stop_btn, 2, 1)
+        
+        lay.addLayout(ctrl_layout)
         
         # Добавляем слайдер для регулировки скорости
         speed_layout = QHBoxLayout()
@@ -328,16 +286,11 @@ class LaserRangefinderApp(QMainWindow):
         speed_layout.addWidget(self.speed_label)
         lay.addLayout(speed_layout)
         
-        # Активируем кнопки нового контроллера поворотки
-        if PAN_TILT_AVAILABLE and self.use_pan_tilt and self.pan_tilt_controller and self.pan_tilt_controller.connected:
-            if hasattr(self, 'pan_tilt_diag_up_left_btn'):  # Проверяем, были ли созданы кнопки
-                for btn in [self.pan_tilt_diag_up_left_btn, self.pan_tilt_up_btn, 
-                           self.pan_tilt_diag_up_right_btn, self.pan_tilt_left_btn, 
-                           self.pan_tilt_stop_btn, self.pan_tilt_right_btn, 
-                           self.pan_tilt_diag_down_left_btn, self.pan_tilt_down_btn, 
-                           self.pan_tilt_diag_down_right_btn, self.pan_tilt_home_btn,
-                           self.pan_tilt_diag_btn]:
-                    btn.setEnabled(True)
+        # Активируем/деактивируем кнопки в зависимости от доступности контроллера
+        controller_available = self.camera_controller is not None
+        for btn in [self.zoom_in_btn, self.zoom_out_btn, self.up_btn, self.down_btn, 
+                   self.left_btn, self.right_btn, self.stop_btn]:
+            btn.setEnabled(controller_available)
         
         return grp
 
@@ -937,157 +890,6 @@ class LaserRangefinderApp(QMainWindow):
             self.log_signal.emit("Camera controller not initialized")
 
     # ═══════════════════════════════════════════════════════════════════
-    #  Pan-Tilt Controls (new functionality)
-    # ═══════════════════════════════════════════════════════════════════
-    def _pan_tilt_move_pan(self, direction):
-        """Движение по оси панорамирования."""
-        if self.pan_tilt_controller and self.pan_tilt_controller.connected:
-            try:
-                # Проверяем, занята ли ось
-                if self.pan_tilt_controller.is_pan_busy():
-                    self.log_signal.emit("Pan axis is busy, cannot start new movement")
-                    return False
-                
-                slider_value = self.speed_slider.value()  # от 1 до 10
-                base_speed = max(2.0, slider_value * 2.0)  # базовая скорость от 2 до 20 °/с (минимум 2.0)
-                speed = base_speed * direction
-                success = self.pan_tilt_controller.move_pan(speed)
-                if success:
-                    self.log_signal.emit(f"Pan movement: {speed:+.2f}°/s")
-                else:
-                    self.log_signal.emit(f"Pan movement command failed to send")
-            except Exception as e:
-                self.log_signal.emit(f"Pan movement failed: {e}")
-        else:
-            self.log_signal.emit("Pan-tilt controller not initialized or not connected")
-
-    def _pan_tilt_move_tilt(self, direction):
-        """Движение по оси наклона."""
-        if self.pan_tilt_controller and self.pan_tilt_controller.connected:
-            try:
-                # Проверяем, занята ли ось
-                if self.pan_tilt_controller.is_tilt_busy():
-                    self.log_signal.emit("Tilt axis is busy, cannot start new movement")
-                    return False
-                
-                slider_value = self.speed_slider.value()  # от 1 до 10
-                base_speed = max(2.0, slider_value * 1.0)  # базовая скорость от 2 до 10 °/с (минимум 2.0)
-                speed = base_speed * direction
-                success = self.pan_tilt_controller.move_tilt(speed)
-                if success:
-                    self.log_signal.emit(f"Tilt movement: {speed:+.2f}°/s")
-                else:
-                    self.log_signal.emit(f"Tilt movement command failed to send")
-            except Exception as e:
-                self.log_signal.emit(f"Tilt movement failed: {e}")
-        else:
-            self.log_signal.emit("Pan-tilt controller not initialized or not connected")
-
-    def _pan_tilt_move_diagonal(self, pan_direction, tilt_direction):
-        """Диагональное движение."""
-        if self.pan_tilt_controller and self.pan_tilt_controller.connected:
-            try:
-                # Проверяем, заняты ли оси
-                pan_busy = self.pan_tilt_controller.is_pan_busy()
-                tilt_busy = self.pan_tilt_controller.is_tilt_busy()
-                
-                if pan_busy or tilt_busy:
-                    if pan_busy and tilt_busy:
-                        self.log_signal.emit("Both axes are busy, cannot start new movement")
-                    elif pan_busy:
-                        self.log_signal.emit("Pan axis is busy, cannot start new movement")
-                    else:
-                        self.log_signal.emit("Tilt axis is busy, cannot start new movement")
-                    return False
-                
-                slider_value = self.speed_slider.value()  # от 1 до 10
-                pan_base_speed = max(2.0, slider_value * 2.0)  # 2-20 °/с
-                tilt_base_speed = max(2.0, slider_value * 1.0)  # 2-10 °/с
-                pan_speed = pan_base_speed * pan_direction
-                tilt_speed = tilt_base_speed * tilt_direction
-                success = self.pan_tilt_controller.move_pan_tilt(pan_speed, tilt_speed)
-                if success:
-                    self.log_signal.emit(f"Diagonal movement: Pan {pan_speed:+.2f}°/s, Tilt {tilt_speed:+.2f}°/s")
-                else:
-                    self.log_signal.emit(f"Diagonal movement command failed to send")
-            except Exception as e:
-                self.log_signal.emit(f"Diagonal movement failed: {e}")
-        else:
-            self.log_signal.emit("Pan-tilt controller not initialized or not connected")
-
-    def _pan_tilt_stop(self):
-        """Остановка движения по обеим осям."""
-        if self.pan_tilt_controller and self.pan_tilt_controller.connected:
-            try:
-                success = self.pan_tilt_controller.stop_all()
-                if success:
-                    self.log_signal.emit("Pan-tilt stop command sent")
-                else:
-                    self.log_signal.emit("Pan-tilt stop command failed to send")
-            except Exception as e:
-                self.log_signal.emit(f"Pan-tilt stop failed: {e}")
-        else:
-            self.log_signal.emit("Pan-tilt controller not initialized or not connected")
-
-    def _pan_tilt_stop_pan(self):
-        """Остановка движения по оси панорамирования."""
-        if self.pan_tilt_controller and self.pan_tilt_controller.connected:
-            try:
-                # Просто отправляем команду остановки без проверки занятости
-                success = self.pan_tilt_controller.stop_pan()
-                if success:
-                    self.log_signal.emit("Pan stop command sent")
-                else:
-                    self.log_signal.emit("Pan stop command failed to send")
-            except Exception as e:
-                self.log_signal.emit(f"Pan stop failed: {e}")
-        else:
-            self.log_signal.emit("Pan-tilt controller not initialized or not connected")
-
-    def _pan_tilt_stop_tilt(self):
-        """Остановка движения по оси наклона."""
-        if self.pan_tilt_controller and self.pan_tilt_controller.connected:
-            try:
-                # Просто отправляем команду остановки без проверки занятости
-                success = self.pan_tilt_controller.stop_tilt()
-                if success:
-                    self.log_signal.emit("Tilt stop command sent")
-                else:
-                    self.log_signal.emit("Tilt stop command failed to send")
-            except Exception as e:
-                self.log_signal.emit(f"Tilt stop failed: {e}")
-        else:
-            self.log_signal.emit("Pan-tilt controller not initialized or not connected")
-
-    def _pan_tilt_go_home(self):
-        """Возврат в домашнюю позицию."""
-        if self.pan_tilt_controller and self.pan_tilt_controller.connected:
-            try:
-                success = self.pan_tilt_controller.go_to_home()
-                if success:
-                    self.log_signal.emit("Go home command sent")
-                else:
-                    self.log_signal.emit("Go home command failed to send")
-            except Exception as e:
-                self.log_signal.emit(f"Go home failed: {e}")
-        else:
-            self.log_signal.emit("Pan-tilt controller not initialized or not connected")
-
-    def _pan_tilt_start_self_test(self):
-        """Начать самодиагностику."""
-        if self.pan_tilt_controller and self.pan_tilt_controller.connected:
-            try:
-                success = self.pan_tilt_controller.start_self_diagnosis()
-                if success:
-                    self.log_signal.emit("Self-test command sent")
-                else:
-                    self.log_signal.emit("Self-test command failed to send")
-            except Exception as e:
-                self.log_signal.emit(f"Self-test failed: {e}")
-        else:
-            self.log_signal.emit("Pan-tilt controller not initialized or not connected")
-
-    # ═══════════════════════════════════════════════════════════════════
     #  Overlay controls
     # ═══════════════════════════════════════════════════════════════════
     def _ov_target_changed(self, v):  self.overlay.target_type = v
@@ -1150,20 +952,6 @@ class LaserRangefinderApp(QMainWindow):
         # Оставляем только обновление прогресс-бара при непрерывных измерениях
         if self.is_ranging:
             self.progress_bar.setValue((self.progress_bar.value()+10)%100)
-        
-        # Обновляем позиции поворотки, если контроллер доступен
-        if (PAN_TILT_AVAILABLE and self.use_pan_tilt and 
-            self.pan_tilt_controller and self.pan_tilt_controller.connected):
-            try:
-                pan_pos = self.pan_tilt_controller.get_current_pan_position()
-                tilt_pos = self.pan_tilt_controller.get_current_tilt_position()
-                if pan_pos is not None and tilt_pos is not None:
-                    self.pan_tilt_pos_label.setText(f"Pan: {pan_pos:.2f}°, Tilt: {tilt_pos:.2f}°")
-                elif hasattr(self, 'pan_tilt_pos_label'):
-                    self.pan_tilt_pos_label.setText("Pan: --°, Tilt: --°")
-            except:
-                if hasattr(self, 'pan_tilt_pos_label'):
-                    self.pan_tilt_pos_label.setText("Pan: --°, Tilt: --°")
 
     # ═══════════════════════════════════════════════════════════════════
     #  System info
@@ -1228,12 +1016,6 @@ class LaserRangefinderApp(QMainWindow):
         if self.camera_controller:
             try:
                 self.camera_controller.disconnect()
-            except:
-                pass
-        # Отключаем контроллер поворотки при закрытии приложения
-        if self.pan_tilt_controller:
-            try:
-                self.pan_tilt_controller.disconnect()
             except:
                 pass
         e.accept()
