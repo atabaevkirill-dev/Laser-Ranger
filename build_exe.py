@@ -29,6 +29,7 @@ def build_executable():
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "laser_rangefinder.spec",  # Используем наш спецификационный файл
+        "--onefile",  # Указываем режим сборки onefile
         "--clean",
         "--noconfirm"
     ]
