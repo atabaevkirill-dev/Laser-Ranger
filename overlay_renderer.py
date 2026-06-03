@@ -266,16 +266,18 @@ def _draw_hud(img, H, W, dist, target_type, col):
         f'EL  : {el:.1f}',
         f'MODE: LRF',
     ]
+    # Рисуем текст с меньшим количеством операций
     for i, txt in enumerate(lines):
         y = 18 + i*18
-        cv2.putText(img, txt, (9, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 3, cv2.LINE_AA)
-        cv2.putText(img, txt, (9, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col,    1, cv2.LINE_AA)
+        # Рисуем только один раз с цветом, без двойного текста для теневого эффекта
+        cv2.putText(img, txt, (9, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+    
     # правый блок
     ts = time.strftime('%H:%M:%S')
     for i, txt in enumerate([ts, 'ARMED', 'TRACKING']):
         y = 18 + i*18
-        cv2.putText(img, txt, (W-95, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0,0,0), 3, cv2.LINE_AA)
-        cv2.putText(img, txt, (W-95, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, col,     1, cv2.LINE_AA)
+        # Рисуем только один раз с цветом, без двойного текста для теневого эффекта
+        cv2.putText(img, txt, (W-95, y), cv2.FONT_HERSHEY_SIMPLEX, 0.42, col, 1, cv2.LINE_AA)
 
 
 def _draw_rings(img, cx, cy, R, col, alpha_frame):
@@ -326,9 +328,10 @@ def render(frame: np.ndarray, st: OverlayState) -> np.ndarray:
         # Преобразуем обратно в 3-канальный формат, чтобы совпадало с ожидаемым форматом
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
 
-    # Коррекция яркости
+    # Коррекция яркости (оптимизированная версия)
     if st.brightness != 1.0:
-        frame = np.clip(frame.astype(np.float32) * st.brightness, 0, 255).astype(np.uint8)
+        # Используем более быструю операцию умножения вместо clip
+        frame = cv2.convertScaleAbs(frame, alpha=st.brightness, beta=0)
 
     # Слой для прозрачного оверлея
     overlay = frame.copy()
@@ -346,7 +349,11 @@ def render(frame: np.ndarray, st: OverlayState) -> np.ndarray:
     RETICLE_DRAW[st.reticle](overlay, cx, cy, R, col, lw)
 
     # Смешиваем слой с прицелом
-    cv2.addWeighted(overlay, st.opacity, frame, 1 - st.opacity, 0, frame)
+    if st.opacity < 1.0:
+        cv2.addWeighted(overlay, st.opacity, frame, 1 - st.opacity, 0, frame)
+    else:
+        # Если прозрачность 1.0, просто копируем оверлей
+        frame[:] = overlay[:]
 
     # 4. HUD и шкала рисуем поверх без прозрачности
     if st.show_hud:

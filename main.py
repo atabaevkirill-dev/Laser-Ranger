@@ -27,19 +27,45 @@ from protocol_base        import CMD_CONTINUE_RANGING, CMD_RANGING_ABNORMAL, dec
 from overlay_renderer     import OverlayState, render as overlay_render, COLORS
 
 try:
-    from onvif_camera_control import OnvifCameraController, PelcoDController
+    from onvif_camera_control import OnvifCameraController, PelcoDController, UniversalCameraController
     ONVIF_AVAILABLE = True
 except ImportError:
     ONVIF_AVAILABLE = False
     print("ONVIF library not available. Install 'onvif_zeep' to enable ONVIF camera control.")
 
-# Импортируем наш новый контроллер поворотки
+# Импортируем универсальный контроллер отдельно
+try:
+    from onvif_camera_control import UniversalCameraController
+    UNIVERSAL_CAMERA_CONTROLLER_AVAILABLE = True
+except ImportError:
+    UNIVERSAL_CAMERA_CONTROLLER_AVAILABLE = False
+    print("Universal camera controller not available.")
+
+# Импортируем старый контроллер поворотки
 try:
     from pan_tilt_controller import PanTiltController
     PAN_TILT_AVAILABLE = True
 except ImportError:
     PAN_TILT_AVAILABLE = False
     print("Pan-tilt controller not available.")
+
+# Создаем специальный QLabel, который может обрабатывать колесо мыши
+class CameraLabel(QLabel):
+    """Специальная метка для камеры, которая обрабатывает события колеса мыши для зума"""
+    mouse_wheel_event = pyqtSignal(int)  # Сигнал для передачи направления вращения колеса
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMouseTracking(True)
+        
+    def wheelEvent(self, event):
+        """Обработка события колеса мыши"""
+        delta = event.angleDelta().y()
+        if delta > 0:
+            self.mouse_wheel_event.emit(1)  # Вращение вперед (увеличение)
+        else:
+            self.mouse_wheel_event.emit(-1)  # Вращение назад (уменьшение)
+        event.accept()
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Стили
@@ -82,16 +108,33 @@ class CameraThread(QThread):
     frame_ready = pyqtSignal(np.ndarray)
     error       = pyqtSignal(str)
 
-    def __init__(self, url: str, overlay: OverlayState):
+    def __init__(self, url: str, overlay: OverlayState, config):
         super().__init__()
         self.url     = url
         self.overlay = overlay
+        self.config = config
         self._active = False
 
     def run(self):
         self._active = True
         cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Получаем параметры из конфигурации для уменьшения задержки
+        buffer_size = self.config.getint('CAMERA', 'buffer_size', fallback=1)
+        frame_width = self.config.getint('CAMERA', 'frame_width', fallback=640)
+        frame_height = self.config.getint('CAMERA', 'frame_height', fallback=480)
+        fps = self.config.getint('CAMERA', 'fps', fallback=30)
+        
+        # Устанавливаем минимальный размер буфера для уменьшения задержки
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, buffer_size)
+        # Дополнительные параметры для уменьшения задержки
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M', 'J', 'P', 'G'))
+        cap.set(cv2.CAP_PROP_FPS, fps)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, frame_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, frame_height)
+        # Отключаем автоподстройку яркости, контраста и насыщенности для уменьшения задержки
+        cap.set(cv2.CAP_PROP_AUTO_WB, 0)
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 0.25)
+        
         if not cap.isOpened():
             self.error.emit(f"Cannot open: {self.url}")
             return
@@ -100,9 +143,11 @@ class CameraThread(QThread):
             if not ret:
                 self.error.emit("Stream lost")
                 break
+            # Выполняем отрисовку оверлея только когда действительно нужно
             frame = overlay_render(frame, self.overlay)
             self.frame_ready.emit(frame)
-            self.msleep(33)
+            # Уменьшаем задержку между кадрами для более быстрого обновления
+            self.msleep(10)  # Уменьшено с 33 до 10 мс для более частого обновления
         cap.release()
 
     def stop(self):
@@ -134,7 +179,7 @@ class LaserRangefinderApp(QMainWindow):
         self.camera_thread  = None
 
         self.config = configparser.ConfigParser()
-        self.config.read('config.ini')
+        self.config.read('config.ini', encoding='utf-8')
 
         # Инициализация камеры
         self.camera_controller = None
@@ -152,18 +197,49 @@ class LaserRangefinderApp(QMainWindow):
                 print(f"Successfully connected to pan-tilt controller at {pan_tilt_host}:{pan_tilt_port}")
             else:
                 print(f"Failed to connect to pan-tilt controller at {pan_tilt_host}:{pan_tilt_port}")
+                self.pan_tilt_controller = None  # Устанавливаем в None, если соединение не удалось
+
         
-        # Инициализация контроллера камеры
-        if self.use_onvif and ONVIF_AVAILABLE:
+        # Инициализация универсального контроллера камеры (для управления камерой и повороткой)
+        camera_control_method = self.config.get('CAMERA', 'camera_control_method', fallback='onvif')
+        if camera_control_method == 'onvif' and ONVIF_AVAILABLE:
             onvif_ip = self.config.get('CAMERA', 'onvif_ip', fallback='192.168.1.68')
             onvif_user = self.config.get('CAMERA', 'onvif_username', fallback='admin')
             onvif_pass = self.config.get('CAMERA', 'onvif_password', fallback='12qwaszx')
             onvif_port = self.config.getint('CAMERA', 'onvif_port', fallback=80)
-            self.camera_controller = OnvifCameraController(onvif_ip, onvif_user, onvif_pass, onvif_port)
+            self.camera_controller = UniversalCameraController(
+                control_method='onvif',
+                ip=onvif_ip,
+                username=onvif_user,
+                password=onvif_pass,
+                port=onvif_port
+            )
+        elif camera_control_method == 'pelco_d' and UNIVERSAL_CAMERA_CONTROLLER_AVAILABLE:
+            pelco_d_ip = self.config.get('CAMERA', 'pelco_d_ip', fallback='192.168.1.120:80')
+            self.camera_controller = UniversalCameraController(
+                control_method='pelco_d',
+                ip=pelco_d_ip
+            )
         
-        elif self.use_pelco_d:
-            pelco_port = self.config.get('CAMERA', 'pelco_d_port', fallback='COM1')
-            self.camera_controller = PelcoDController(pelco_port)
+        # Попытка подключения при инициализации
+        if hasattr(self, 'camera_controller') and self.camera_controller:
+            if self.camera_controller.connect():
+                print(f"Successfully connected to camera via {camera_control_method} at {self.camera_controller.ip}")
+            else:
+                print(f"Failed to connect to camera via {camera_control_method}")
+        
+        # Убираем отдельный контроллер поворотки, так как он теперь встроен в контроллер камеры
+        # self.pan_tilt_controller = None
+        # self.use_pan_tilt = self.config.getboolean('PAN_TILT', 'use_pan_tilt', fallback=False)
+        # if self.use_pan_tilt and PAN_TILT_AVAILABLE:
+        #     pan_tilt_host = self.config.get('PAN_TILT', 'host', fallback='192.168.1.115')
+        #     pan_tilt_port = self.config.getint('PAN_TILT', 'port', fallback=9760)
+        #     self.pan_tilt_controller = PanTiltController(pan_tilt_host, pan_tilt_port)
+        #     if self.pan_tilt_controller.connect():
+        #         print(f"Successfully connected to pan-tilt controller at {pan_tilt_host}:{pan_tilt_port}")
+        #     else:
+        #         print(f"Failed to connect to pan-tilt controller at {pan_tilt_host}:{pan_tilt_port}")
+        #         self.pan_tilt_controller = None  # Устанавливаем в None, если соединение не удалось
 
         # Оставляем только флаг состояния соединения
         self.connection_healthy = True  # Состояние соединения
@@ -248,73 +324,73 @@ class LaserRangefinderApp(QMainWindow):
 
     def _build_camera_controls_group(self):
         """Создание группы элементов управления камерой."""
-        grp = QGroupBox("Pan-Tilt Controls"); lay = QVBoxLayout(grp)
+        grp = QGroupBox("Camera & Pan-Tilt Controls"); lay = QVBoxLayout(grp)
         
-        # Создаем кнопки управления повороткой (новый контроллер)
-        if PAN_TILT_AVAILABLE and self.use_pan_tilt:
-            pan_tilt_layout = QGridLayout()
+        # Создаем кнопки управления камерой и повороткой через универсальный контроллер
+        if hasattr(self, 'camera_controller') and self.camera_controller:
+            camera_control_layout = QGridLayout()
             
-            # Диагональные кнопки для нового контроллера
-            self.pan_tilt_diag_up_left_btn = QPushButton("↖")
-            self.pan_tilt_diag_up_left_btn.pressed.connect(lambda: self._pan_tilt_move_diagonal(-1, 1))
-            self.pan_tilt_diag_up_left_btn.released.connect(self._pan_tilt_stop)  # Останавливает обе оси
-            pan_tilt_layout.addWidget(self.pan_tilt_diag_up_left_btn, 0, 0)
+            # Диагональные кнопки для универсального контроллера
+            self.diag_up_left_btn = QPushButton("↖")
+            self.diag_up_left_btn.pressed.connect(lambda: self._camera_move_diagonal(-1, 1))
+            self.diag_up_left_btn.released.connect(self._camera_stop)  # Останавливает обе оси
+            camera_control_layout.addWidget(self.diag_up_left_btn, 0, 0)
             
-            self.pan_tilt_up_btn = QPushButton("↑")
-            self.pan_tilt_up_btn.pressed.connect(lambda: self._pan_tilt_move_tilt(1))
-            self.pan_tilt_up_btn.released.connect(self._pan_tilt_stop_tilt)  # Останавливает только tilt
-            pan_tilt_layout.addWidget(self.pan_tilt_up_btn, 0, 1)
+            self.up_btn = QPushButton("↑")
+            self.up_btn.pressed.connect(lambda: self._camera_move_tilt(1))
+            self.up_btn.released.connect(self._camera_stop_tilt)  # Останавливает только tilt
+            camera_control_layout.addWidget(self.up_btn, 0, 1)
             
-            self.pan_tilt_diag_up_right_btn = QPushButton("↗")
-            self.pan_tilt_diag_up_right_btn.pressed.connect(lambda: self._pan_tilt_move_diagonal(1, 1))
-            self.pan_tilt_diag_up_right_btn.released.connect(self._pan_tilt_stop)  # Останавливает обе оси
-            pan_tilt_layout.addWidget(self.pan_tilt_diag_up_right_btn, 0, 2)
+            self.diag_up_right_btn = QPushButton("↗")
+            self.diag_up_right_btn.pressed.connect(lambda: self._camera_move_diagonal(1, 1))
+            self.diag_up_right_btn.released.connect(self._camera_stop)  # Останавливает обе оси
+            camera_control_layout.addWidget(self.diag_up_right_btn, 0, 2)
             
-            self.pan_tilt_left_btn = QPushButton("←")
-            self.pan_tilt_left_btn.pressed.connect(lambda: self._pan_tilt_move_pan(-1))
-            self.pan_tilt_left_btn.released.connect(self._pan_tilt_stop_pan)  # Останавливает только pan
-            pan_tilt_layout.addWidget(self.pan_tilt_left_btn, 1, 0)
+            self.left_btn = QPushButton("←")
+            self.left_btn.pressed.connect(lambda: self._camera_move_pan(-1))
+            self.left_btn.released.connect(self._camera_stop_pan)  # Останавливает только pan
+            camera_control_layout.addWidget(self.left_btn, 1, 0)
             
             # Меняем местами кнопку "Стоп" и "Домой"
-            self.pan_tilt_stop_btn = QPushButton("⏹ Stop")
-            self.pan_tilt_stop_btn.clicked.connect(self._pan_tilt_stop)  # Останавливает обе оси
-            pan_tilt_layout.addWidget(self.pan_tilt_stop_btn, 1, 1)
+            self.stop_btn = QPushButton("⏹ Stop")
+            self.stop_btn.clicked.connect(self._camera_stop)  # Останавливает обе оси
+            camera_control_layout.addWidget(self.stop_btn, 1, 1)
             
-            self.pan_tilt_right_btn = QPushButton("→")
-            self.pan_tilt_right_btn.pressed.connect(lambda: self._pan_tilt_move_pan(1))
-            self.pan_tilt_right_btn.released.connect(self._pan_tilt_stop_pan)  # Останавливает только pan
-            pan_tilt_layout.addWidget(self.pan_tilt_right_btn, 1, 2)
+            self.right_btn = QPushButton("→")
+            self.right_btn.pressed.connect(lambda: self._camera_move_pan(1))
+            self.right_btn.released.connect(self._camera_stop_pan)  # Останавливает только pan
+            camera_control_layout.addWidget(self.right_btn, 1, 2)
             
-            self.pan_tilt_diag_down_left_btn = QPushButton("↙")
-            self.pan_tilt_diag_down_left_btn.pressed.connect(lambda: self._pan_tilt_move_diagonal(-1, -1))
-            self.pan_tilt_diag_down_left_btn.released.connect(self._pan_tilt_stop)  # Останавливает обе оси
-            pan_tilt_layout.addWidget(self.pan_tilt_diag_down_left_btn, 2, 0)
+            self.diag_down_left_btn = QPushButton("↙")
+            self.diag_down_left_btn.pressed.connect(lambda: self._camera_move_diagonal(-1, -1))
+            self.diag_down_left_btn.released.connect(self._camera_stop)  # Останавливает обе оси
+            camera_control_layout.addWidget(self.diag_down_left_btn, 2, 0)
             
-            self.pan_tilt_down_btn = QPushButton("↓")
-            self.pan_tilt_down_btn.pressed.connect(lambda: self._pan_tilt_move_tilt(-1))
-            self.pan_tilt_down_btn.released.connect(self._pan_tilt_stop_tilt)  # Останавливает только tilt
-            pan_tilt_layout.addWidget(self.pan_tilt_down_btn, 2, 1)
+            self.down_btn = QPushButton("↓")
+            self.down_btn.pressed.connect(lambda: self._camera_move_tilt(-1))
+            self.down_btn.released.connect(self._camera_stop_tilt)  # Останавливает только tilt
+            camera_control_layout.addWidget(self.down_btn, 2, 1)
             
-            self.pan_tilt_diag_down_right_btn = QPushButton("↘")
-            self.pan_tilt_diag_down_right_btn.pressed.connect(lambda: self._pan_tilt_move_diagonal(1, -1))
-            self.pan_tilt_diag_down_right_btn.released.connect(self._pan_tilt_stop)  # Останавливает обе оси
-            pan_tilt_layout.addWidget(self.pan_tilt_diag_down_right_btn, 2, 2)
+            self.diag_down_right_btn = QPushButton("↘")
+            self.diag_down_right_btn.pressed.connect(lambda: self._camera_move_diagonal(1, -1))
+            self.diag_down_right_btn.released.connect(self._camera_stop)  # Останавливает обе оси
+            camera_control_layout.addWidget(self.diag_down_right_btn, 2, 2)
             
             # Кнопка "Домой" теперь на месте кнопки "Стоп"
-            self.pan_tilt_home_btn = QPushButton("🏠 Home")
-            self.pan_tilt_home_btn.clicked.connect(self._pan_tilt_go_home)
-            pan_tilt_layout.addWidget(self.pan_tilt_home_btn, 3, 0, 1, 3)
+            self.home_btn = QPushButton("🏠 Home")
+            self.home_btn.clicked.connect(self._camera_go_home)
+            camera_control_layout.addWidget(self.home_btn, 3, 0, 1, 3)
             
             # Кнопка самодиагностики
-            self.pan_tilt_diag_btn = QPushButton("🔧 Self-Test")
-            self.pan_tilt_diag_btn.clicked.connect(self._pan_tilt_start_self_test)
-            pan_tilt_layout.addWidget(self.pan_tilt_diag_btn, 4, 0, 1, 3)
+            self.diag_btn = QPushButton("🔧 Self-Test")
+            self.diag_btn.clicked.connect(self._camera_start_self_test)
+            camera_control_layout.addWidget(self.diag_btn, 4, 0, 1, 3)
             
             # Добавляем метку для позиций
-            self.pan_tilt_pos_label = QLabel("Pan: --°, Tilt: --°")
-            pan_tilt_layout.addWidget(self.pan_tilt_pos_label, 5, 0, 1, 3)
+            self.camera_pos_label = QLabel("Pan: --°, Tilt: --°")
+            camera_control_layout.addWidget(self.camera_pos_label, 5, 0, 1, 3)
             
-            lay.addLayout(pan_tilt_layout)
+            lay.addLayout(camera_control_layout)
         
         # Добавляем слайдер для регулировки скорости
         speed_layout = QHBoxLayout()
@@ -328,15 +404,15 @@ class LaserRangefinderApp(QMainWindow):
         speed_layout.addWidget(self.speed_label)
         lay.addLayout(speed_layout)
         
-        # Активируем кнопки нового контроллера поворотки
-        if PAN_TILT_AVAILABLE and self.use_pan_tilt and self.pan_tilt_controller and self.pan_tilt_controller.connected:
-            if hasattr(self, 'pan_tilt_diag_up_left_btn'):  # Проверяем, были ли созданы кнопки
-                for btn in [self.pan_tilt_diag_up_left_btn, self.pan_tilt_up_btn, 
-                           self.pan_tilt_diag_up_right_btn, self.pan_tilt_left_btn, 
-                           self.pan_tilt_stop_btn, self.pan_tilt_right_btn, 
-                           self.pan_tilt_diag_down_left_btn, self.pan_tilt_down_btn, 
-                           self.pan_tilt_diag_down_right_btn, self.pan_tilt_home_btn,
-                           self.pan_tilt_diag_btn]:
+        # Активируем кнопки универсального контроллера
+        if hasattr(self, 'camera_controller') and self.camera_controller:
+            if hasattr(self, 'diag_up_left_btn'):  # Проверяем, были ли созданы кнопки
+                for btn in [self.diag_up_left_btn, self.up_btn, 
+                           self.diag_up_right_btn, self.left_btn, 
+                           self.stop_btn, self.right_btn, 
+                           self.diag_down_left_btn, self.down_btn, 
+                           self.diag_down_right_btn, self.home_btn,
+                           self.diag_btn]:
                     btn.setEnabled(True)
         
         return grp
@@ -460,7 +536,8 @@ class LaserRangefinderApp(QMainWindow):
         self.cam_btn.clicked.connect(self._toggle_camera); cl.addWidget(self.cam_btn)
         lay.addWidget(ctrl)
 
-        self.cam_label = QLabel("Camera not connected")
+        self.cam_label = CameraLabel()  # Используем новый специальный виджет
+        self.cam_label.mouse_wheel_event.connect(self._on_camera_wheel)  # Подключаем обработчик колеса мыши
         self.cam_label.setAlignment(Qt.AlignCenter)
         self.cam_label.setStyleSheet("background:#111;color:#555;border:1px solid #333")
         self.cam_label.setMinimumSize(640, 400)
@@ -469,6 +546,24 @@ class LaserRangefinderApp(QMainWindow):
             self.cam_label.sizePolicy().Expanding)
         lay.addWidget(self.cam_label, 1)
         return grp
+
+    def _on_camera_wheel(self, direction):
+        """Обработка события колеса мыши для зума камеры"""
+        if not self.camera_controller:
+            self.log_signal.emit("Camera controller not initialized")
+            return
+            
+        try:
+            if direction > 0:
+                # Вращение вперед - увеличение (zoom in)
+                self.camera_controller.zoom_in()
+                self.log_signal.emit("Zoom In via mouse wheel")
+            else:
+                # Вращение назад - уменьшение (zoom out)
+                self.camera_controller.zoom_out()
+                self.log_signal.emit("Zoom Out via mouse wheel")
+        except Exception as e:
+            self.log_signal.emit(f"Mouse wheel zoom failed: {e}")
 
     # ── Overlay controls ──────────────────────────────────────────────
     def _build_overlay_group(self):
@@ -796,7 +891,7 @@ class LaserRangefinderApp(QMainWindow):
         url = self.cam_url_input.text().strip()
         if not url: QMessageBox.warning(self,"Camera","Enter RTSP URL."); return
         self.cam_label.setText("Connecting…")
-        self.camera_thread = CameraThread(url, self.overlay)
+        self.camera_thread = CameraThread(url, self.overlay, self.config)
         self.camera_thread.frame_ready.connect(self._on_camera_frame)
         self.camera_thread.error.connect(self._on_camera_error)
         self.camera_thread.start()
@@ -808,19 +903,156 @@ class LaserRangefinderApp(QMainWindow):
         self.cam_btn.setText("▶ Connect"); self.log_signal.emit("Camera disconnected")
 
     def _on_camera_frame(self, frame: np.ndarray):
+        # Получаем размеры метки для отображения
         lw = max(self.cam_label.width(),  320)
         lh = max(self.cam_label.height(), 240)
         fh, fw = frame.shape[:2]
         scale = min(lw/fw, lh/fh)
         nw, nh = int(fw*scale), int(fh*scale)
-        frame = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = QImage(rgb.data, nw, nh, nw*3, QImage.Format_RGB888)
-        self.cam_label.setPixmap(QPixmap.fromImage(img))
+        # Используем наиболее быструю интерполяцию для изменения размера
+        frame_resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_NEAREST)
+        rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
+        # Создаем QImage напрямую из массива numpy для ускорения
+        h, w, ch = rgb.shape
+        bytes_per_line = ch * w
+        q_img = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+        # Обновляем pixmap напрямую без создания лишних объектов
+        self.cam_label.setPixmap(QPixmap.fromImage(q_img))
 
     def _on_camera_error(self, msg):
         self.cam_label.setText(f"Camera error:\n{msg}")
         self.cam_btn.setText("▶ Connect"); self.log_signal.emit(f"Camera error: {msg}")
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Camera & Pan-Tilt Controls (universal controller)
+    # ═══════════════════════════════════════════════════════════════════
+    def _camera_move_pan(self, direction):
+        """Движение по оси панорамирования."""
+        if self.camera_controller:
+            try:
+                slider_value = self.speed_slider.value()  # от 1 до 10
+                base_speed = max(2.0, slider_value * 2.0)  # базовая скорость от 2 до 20 °/с (минимум 2.0)
+                speed = base_speed * direction
+                # Для универсального контроллера передаем нулевую скорость по наклону
+                success = self.camera_controller.pan_tilt_move(speed, 0)
+                if success:
+                    self.log_signal.emit(f"Pan movement: {speed:+.2f}°/s")
+                else:
+                    self.log_signal.emit(f"Pan movement command failed to send")
+            except Exception as e:
+                self.log_signal.emit(f"Pan movement failed: {e}")
+        else:
+            self.log_signal.emit("Camera controller not initialized")
+
+    def _camera_move_tilt(self, direction):
+        """Движение по оси наклона."""
+        if self.camera_controller:
+            try:
+                slider_value = self.speed_slider.value()  # от 1 до 10
+                base_speed = max(2.0, slider_value * 1.0)  # базовая скорость от 2 до 10 °/с (минимум 2.0)
+                speed = base_speed * direction
+                # Для универсального контроллера передаем нулевую скорость по панорамированию
+                success = self.camera_controller.pan_tilt_move(0, speed)
+                if success:
+                    self.log_signal.emit(f"Tilt movement: {speed:+.2f}°/s")
+                else:
+                    self.log_signal.emit(f"Tilt movement command failed to send")
+            except Exception as e:
+                self.log_signal.emit(f"Tilt movement failed: {e}")
+        else:
+            self.log_signal.emit("Camera controller not initialized")
+
+    def _camera_move_diagonal(self, pan_direction, tilt_direction):
+        """Диагональное движение."""
+        if self.camera_controller:
+            try:
+                slider_value = self.speed_slider.value()  # от 1 до 10
+                pan_base_speed = max(2.0, slider_value * 2.0)  # 2-20 °/с
+                tilt_base_speed = max(2.0, slider_value * 1.0)  # 2-10 °/с
+                pan_speed = pan_base_speed * pan_direction
+                tilt_speed = tilt_base_speed * tilt_direction
+                success = self.camera_controller.pan_tilt_move(pan_speed, tilt_speed)
+                if success:
+                    self.log_signal.emit(f"Diagonal movement: Pan {pan_speed:+.2f}°/s, Tilt {tilt_speed:+.2f}°/s")
+                else:
+                    self.log_signal.emit(f"Diagonal movement command failed to send")
+            except Exception as e:
+                self.log_signal.emit(f"Diagonal movement failed: {e}")
+        else:
+            self.log_signal.emit("Camera controller not initialized")
+
+    def _camera_stop(self):
+        """Остановка движения по обеим осям."""
+        if self.camera_controller:
+            try:
+                success = self.camera_controller.pan_tilt_stop()
+                if success:
+                    self.log_signal.emit("Pan-tilt stop command sent")
+                else:
+                    self.log_signal.emit("Pan-tilt stop command failed to send")
+            except Exception as e:
+                self.log_signal.emit(f"Pan-tilt stop failed: {e}")
+        else:
+            self.log_signal.emit("Camera controller not initialized")
+
+    def _camera_stop_pan(self):
+        """Остановка движения по оси панорамирования."""
+        if self.camera_controller:
+            try:
+                # Для универсального контроллера останавливаем обе оси, так как отдельная остановка одной оси
+                # может не поддерживаться
+                success = self.camera_controller.pan_tilt_stop()
+                if success:
+                    self.log_signal.emit("Pan stop command sent")
+                else:
+                    self.log_signal.emit("Pan stop command failed to send")
+            except Exception as e:
+                self.log_signal.emit(f"Pan stop failed: {e}")
+        else:
+            self.log_signal.emit("Camera controller not initialized")
+
+    def _camera_stop_tilt(self):
+        """Остановка движения по оси наклона."""
+        if self.camera_controller:
+            try:
+                # Для универсального контроллера останавливаем обе оси, так как отдельная остановка одной оси
+                # может не поддерживаться
+                success = self.camera_controller.pan_tilt_stop()
+                if success:
+                    self.log_signal.emit("Tilt stop command sent")
+                else:
+                    self.log_signal.emit("Tilt stop command failed to send")
+            except Exception as e:
+                self.log_signal.emit(f"Tilt stop failed: {e}")
+        else:
+            self.log_signal.emit("Camera controller not initialized")
+
+    def _camera_go_home(self):
+        """Возврат в домашнюю позицию."""
+        if self.camera_controller:
+            try:
+                # Пока просто останавливаем движение, так как возврат в домашнюю позицию
+                # может отличаться для разных протоколов
+                success = self.camera_controller.pan_tilt_stop()
+                if success:
+                    self.log_signal.emit("Go home command sent (using stop)")
+                else:
+                    self.log_signal.emit("Go home command failed to send")
+            except Exception as e:
+                self.log_signal.emit(f"Go home failed: {e}")
+        else:
+            self.log_signal.emit("Camera controller not initialized")
+
+    def _camera_start_self_test(self):
+        """Начать самодиагностику."""
+        if self.camera_controller:
+            try:
+                # Самодиагностика может не поддерживаться универсальным контроллером
+                self.log_signal.emit("Self-test not implemented for universal controller")
+            except Exception as e:
+                self.log_signal.emit(f"Self-test failed: {e}")
+        else:
+            self.log_signal.emit("Camera controller not initialized")
 
     # ═══════════════════════════════════════════════════════════════════
     #  Camera Controls
@@ -1151,23 +1383,37 @@ class LaserRangefinderApp(QMainWindow):
         if self.is_ranging:
             self.progress_bar.setValue((self.progress_bar.value()+10)%100)
         
-        # Обновляем позиции поворотки, если контроллер доступен
-        if (PAN_TILT_AVAILABLE and self.use_pan_tilt and 
-            self.pan_tilt_controller and self.pan_tilt_controller.connected):
-            try:
-                pan_pos = self.pan_tilt_controller.get_current_pan_position()
-                tilt_pos = self.pan_tilt_controller.get_current_tilt_position()
-                if pan_pos is not None and tilt_pos is not None:
-                    self.pan_tilt_pos_label.setText(f"Pan: {pan_pos:.2f}°, Tilt: {tilt_pos:.2f}°")
-                elif hasattr(self, 'pan_tilt_pos_label'):
-                    self.pan_tilt_pos_label.setText("Pan: --°, Tilt: --°")
-            except:
-                if hasattr(self, 'pan_tilt_pos_label'):
-                    self.pan_tilt_pos_label.setText("Pan: --°, Tilt: --°")
+        # Больше не обновляем позиции поворотки, так как теперь используется универсальный контроллер
+        # и позиции могут быть недоступны в некоторых режимах
 
     # ═══════════════════════════════════════════════════════════════════
     #  System info
     # ═══════════════════════════════════════════════════════════════════
+    def _on_system_info(self, data):
+        self.system_info_label.setText(data)
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  Calibration
+    # ═══════════════════════════════════════════════════════════════════
+    def _on_calib_status(self, data):
+        self.calib_status_label.setText(data)
+
+    def _on_calib_progress(self, data):
+        self.calib_progress_bar.setValue(data)
+
+    def _on_calib_result(self, data):
+        self.calib_result_label.setText(data)
+
+    # ═══════════════════════════════════════════════════════════════════
+    #  System info
+    # ═══════════════════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════════════════
+    #  System info
+    # ═══════════════════════════════════════════════════════════════════
+    def _reset_pan_tilt_label(self):
+        "Reset pan and tilt label to default state"
+        self.pan_tilt_pos_label.setText("Pan: --°, Tilt: --°")
+
     def _do_self_check(self):
         if not self.protocol: return
         r = self.protocol.self_check()
@@ -1224,14 +1470,14 @@ class LaserRangefinderApp(QMainWindow):
         if self.is_ranging: self._stop_continuous()
         if self.is_connected: self._disconnect()
         if self.camera_thread: self._stop_camera()
-        # Отключаем контроллер камеры при закрытии приложения
+        # Отключаем универсальный контроллер камеры при закрытии приложения
         if self.camera_controller:
             try:
                 self.camera_controller.disconnect()
             except:
                 pass
-        # Отключаем контроллер поворотки при закрытии приложения
-        if self.pan_tilt_controller:
+        # Отключаем контроллер поворотки при закрытии приложения (если он был)
+        if hasattr(self, 'pan_tilt_controller') and self.pan_tilt_controller:
             try:
                 self.pan_tilt_controller.disconnect()
             except:

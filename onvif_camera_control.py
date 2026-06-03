@@ -4,6 +4,7 @@ Provides PTZ (Pan-Tilt-Zoom) control functionality using ONVIF protocol.
 """
 
 import threading
+import socket
 from onvif import ONVIFService, ONVIFCamera
 from urllib.parse import urlparse
 
@@ -172,37 +173,48 @@ class OnvifCameraController:
 
 
 class PelcoDController:
-    """Class for controlling cameras using Pelco-D protocol over serial connection."""
+    """Class for controlling cameras using Pelco-D protocol over TCP/IP connection."""
     
-    def __init__(self, serial_port):
-        self.serial_port = serial_port
-        self.serial_conn = None
+    def __init__(self, ip_address, port=80):
+        self.ip = ip_address
+        self.port = port
+        self.tcp_socket = None
         self.active = False
+        self.zoom_speed = 0x30  # Скорость зума по умолчанию
     
     def connect(self):
-        """Connect to serial port for Pelco-D communication."""
+        """Connect to TCP for Pelco-D communication."""
         try:
-            import serial
-            self.serial_conn = serial.Serial(
-                port=self.serial_port,
-                baudrate=2400,
-                bytesize=8,
-                parity='N',
-                stopbits=1,
-                timeout=1
-            )
+            self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.tcp_socket.settimeout(5)
+            self.tcp_socket.connect((self.ip, self.port))
             self.active = True
             return True
         except Exception as e:
-            print(f"Failed to connect to serial port for Pelco-D: {e}")
+            print(f"Failed to connect via TCP for Pelco-D: {e}")
             return False
     
     def disconnect(self):
-        """Close serial connection."""
+        """Close TCP connection."""
         self.active = False
-        if self.serial_conn:
-            self.serial_conn.close()
-            self.serial_conn = None
+        if self.tcp_socket:
+            try:
+                self.tcp_socket.close()
+            except:
+                pass
+            self.tcp_socket = None
+    
+    def send_pelco_d_packet(self, packet):
+        """Send Pelco-D packet via TCP."""
+        if not self.active:
+            return False
+        
+        try:
+            self.tcp_socket.send(packet)
+            return True
+        except Exception as e:
+            print(f"Failed to send Pelco-D packet: {e}")
+            return False
     
     def send_pelco_d_command(self, address, command1, command2, data1, data2):
         """Send a generic Pelco-D command."""
@@ -213,19 +225,22 @@ class PelcoDController:
             # Pelco-D packet format: [0xFF][address][command1][command2][data1][data2][checksum]
             checksum = (address + command1 + command2 + data1 + data2) & 0xFF
             packet = bytearray([0xFF, address, command1, command2, data1, data2, checksum])
-            self.serial_conn.write(packet)
-            return True
+            return self.send_pelco_d_packet(packet)
         except Exception as e:
             print(f"Failed to send Pelco-D command: {e}")
             return False
     
-    def zoom_in(self, speed=0x30):
+    def zoom_in(self, speed=None):
         """Zoom in command."""
+        if speed is None:
+            speed = self.zoom_speed
         # Command: Zoom Tele (Zoom In)
         return self.send_pelco_d_command(0x01, 0x00, 0x08, speed, 0x00)
     
-    def zoom_out(self, speed=0x30):
+    def zoom_out(self, speed=None):
         """Zoom out command."""
+        if speed is None:
+            speed = self.zoom_speed
         # Command: Zoom Wide (Zoom Out)
         return self.send_pelco_d_command(0x01, 0x00, 0x10, speed, 0x00)
     
@@ -256,3 +271,82 @@ class PelcoDController:
     def pan_tilt_stop(self):
         """Stop pan/tilt movement."""
         return self.send_pelco_d_command(0x01, 0x00, 0x00, 0x00, 0x00)
+    
+    def set_zoom_speed(self, speed):
+        """Установить скорость зума (0x00-0x3F)"""
+        if 0 <= speed <= 0x3F:
+            self.zoom_speed = speed
+            return True
+        return False
+
+
+class UniversalCameraController:
+    """Универсальный контроллер камеры, поддерживающий ONVIF и Pelco-D по TCP/IP."""
+    
+    def __init__(self, control_method, ip, username=None, password=None, port=80):
+        self.control_method = control_method  # 'onvif' или 'pelco_d'
+        self.ip = ip
+        self.username = username
+        self.password = password
+        self.port = port
+        self.controller = None
+        
+    def connect(self):
+        """Подключение к камере в зависимости от выбранного метода управления."""
+        if self.control_method == 'onvif':
+            if 'onvif_camera_control' in globals():
+                self.controller = OnvifCameraController(self.ip, self.username, self.password, self.port)
+                return self.controller.connect()
+        elif self.control_method == 'pelco_d':
+            # Разбор адреса IP:PORT если он в формате "IP:PORT"
+            if ':' in self.ip:
+                ip_addr, port = self.ip.split(':')
+                port = int(port)
+                self.controller = PelcoDController(ip_addr, port)
+            else:
+                self.controller = PelcoDController(self.ip, self.port)
+            return self.controller.connect()
+        
+        return False
+    
+    def disconnect(self):
+        """Отключение от камеры."""
+        if self.controller:
+            self.controller.disconnect()
+    
+    def zoom_in(self, speed=None):
+        """Увеличение зума."""
+        if self.controller:
+            if self.control_method == 'onvif':
+                return self.controller.zoom_in(speed)
+            elif self.control_method == 'pelco_d':
+                return self.controller.zoom_in(speed)
+        return False
+    
+    def zoom_out(self, speed=None):
+        """Уменьшение зума."""
+        if self.controller:
+            if self.control_method == 'onvif':
+                return self.controller.zoom_out(speed)
+            elif self.control_method == 'pelco_d':
+                return self.controller.zoom_out(speed)
+        return False
+    
+    def pan_tilt_move(self, pan_speed, tilt_speed):
+        """Движение по осям pan и tilt."""
+        if self.controller:
+            if self.control_method == 'pelco_d':
+                return self.controller.pan_tilt_move(pan_speed, tilt_speed)
+            elif self.control_method == 'onvif':
+                # Для ONVIF используем относительное движение
+                return self.controller.relative_move(x=pan_speed, y=tilt_speed)
+        return False
+    
+    def pan_tilt_stop(self):
+        """Остановка движения по осям pan и tilt."""
+        if self.controller:
+            if self.control_method == 'pelco_d':
+                return self.controller.pan_tilt_stop()
+            elif self.control_method == 'onvif':
+                return self.controller.stop_move(pan_tilt=True, zoom=False)
+        return False
