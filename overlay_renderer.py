@@ -98,16 +98,17 @@ def _draw_building(img, cx, cy, scale):
     bw, bh = int(120*s), int(160*s)
     cv2.rectangle(img, (cx-bw//2, cy-bh), (cx+bw//2, cy+int(5*s)), (85, 80, 70), -1)
     cv2.rectangle(img, (cx-bw//2, cy-bh), (cx+bw//2, cy-bh+int(12*s)), (65, 60, 50), -1)
-    # окна
+    # Windows: use deterministic pattern based on position to avoid flicker
     ww, wh = int(18*s), int(20*s)
     for row in range(4):
         for col in range(3):
             wx = cx - bw//2 + int(20*s) + col*int(38*s)
             wy = cy - bh + int(22*s) + row*int(38*s)
-            bright = np.random.choice([True, False], p=[0.7, 0.3])
+            # Deterministic "lit" based on row/col hash instead of np.random
+            bright = ((row * 7 + col * 13 + 3) % 10) < 7
             wc = (40, 190, 230) if bright else (20, 60, 100)
             cv2.rectangle(img, (wx, wy), (wx+ww, wy+wh), wc, -1)
-    # дверь
+    # Door
     cv2.rectangle(img, (cx-int(15*s), cy-int(30*s)), (cx+int(15*s), cy+int(5*s)), (40, 30, 20), -1)
 
 

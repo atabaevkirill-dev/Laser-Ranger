@@ -1,15 +1,32 @@
 """
 3km Eye-Safe Laser Rangefinder — Desktop Application
-• Serial / TCP-IP подключение к дальномеру
-• Single Shot + Start/Stop Continuous замер
-• IP-камера (RTSP/OpenCV) с военным прицелом поверх кадра
-  - 5 типов целей  (infantry, vehicle, aircraft, building, uav)
-  - 5 стилей прицела (crosshair, mil-dot, BDC, circle, tactical)
-  - 6 цветов, шкала дальности, HUD, управление масштабом/яркостью/прозрачностью
+• Serial / TCP-IP connection to rangefinder
+• Single Shot + Start/Stop Continuous ranging
+• IP camera (RTSP/OpenCV) with military reticle overlay
+  - 5 target types (infantry, vehicle, aircraft, building, uav)
+  - 5 reticle styles (crosshair, mil-dot, BDC, circle, tactical)
+  - 6 colors, range scale, HUD, scale/brightness/opacity controls
 """
 
-import sys, serial, threading, time, socket, configparser, math
-import cv2, numpy as np
+import sys
+import serial
+import threading
+import time
+import socket
+import configparser
+import math
+import logging
+
+import cv2
+import numpy as np
+
+# Configure logging so protocol_handler/debug messages actually appear
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(name)s %(levelname)s: %(message)s',
+    datefmt='%H:%M:%S',
+)
+logger = logging.getLogger(__name__)
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -31,17 +48,10 @@ try:
     ONVIF_AVAILABLE = True
 except ImportError:
     ONVIF_AVAILABLE = False
+    UniversalCameraController = None
     print("ONVIF library not available. Install 'onvif_zeep' to enable ONVIF camera control.")
 
-# Импортируем универсальный контроллер отдельно
-try:
-    from onvif_camera_control import UniversalCameraController
-    UNIVERSAL_CAMERA_CONTROLLER_AVAILABLE = True
-except ImportError:
-    UNIVERSAL_CAMERA_CONTROLLER_AVAILABLE = False
-    print("Universal camera controller not available.")
-
-# Импортируем старый контроллер поворотки
+# Import legacy pan-tilt controller (optional)
 try:
     from pan_tilt_controller import PanTiltController
     PAN_TILT_AVAILABLE = True
@@ -171,18 +181,23 @@ class LaserRangefinderApp(QMainWindow):
         self.protocol       = None
         self.is_connected   = False
         self.is_ranging     = False
+        self._is_ranging_event = threading.Event()   # Thread-safe ranging signal
+        self._multi_targets_lock = threading.Lock()  # Protects multi_targets dict
         self.ranging_thread = None
         self.connection_type = "serial"
         self.multi_targets  = {}
 
         self.overlay        = OverlayState()
         self.camera_thread  = None
+        self._last_frame_rgb = None  # Hold reference to prevent QImage dangling pointer
 
         self.config = configparser.ConfigParser()
         self.config.read('config.ini', encoding='utf-8')
 
-        # Инициализация камеры
+        # Camera controller (pan-tilt movement via Pelco-D)
         self.camera_controller = None
+        # Zoom controller (camera lens zoom via ONVIF)
+        self.zoom_controller = None
         self.use_onvif = self.config.getboolean('CAMERA', 'enable_onvif', fallback=False)
         self.use_pelco_d = self.config.getboolean('CAMERA', 'use_pelco_d', fallback=False)
         
@@ -200,7 +215,22 @@ class LaserRangefinderApp(QMainWindow):
                 self.pan_tilt_controller = None  # Устанавливаем в None, если соединение не удалось
 
         
-        # Инициализация универсального контроллера камеры (для управления камерой и повороткой)
+        # Initialize ONVIF zoom controller (separate from pan-tilt)
+        # Camera lens zoom is always via ONVIF to the camera itself
+        zoom_method = self.config.get('CAMERA', 'zoom_method', fallback='onvif')
+        if zoom_method == 'onvif' and ONVIF_AVAILABLE:
+            onvif_ip = self.config.get('CAMERA', 'onvif_ip', fallback='192.168.1.68')
+            onvif_user = self.config.get('CAMERA', 'onvif_username', fallback='admin')
+            onvif_pass = self.config.get('CAMERA', 'onvif_password', fallback='12qwaszx')
+            onvif_port = self.config.getint('CAMERA', 'onvif_port', fallback=80)
+            self.zoom_controller = OnvifCameraController(onvif_ip, onvif_user, onvif_pass, onvif_port)
+            if self.zoom_controller.connect():
+                print(f"ONVIF zoom controller connected to {onvif_ip}")
+            else:
+                print(f"Failed to connect ONVIF zoom controller to {onvif_ip}")
+                self.zoom_controller = None
+        
+        # Initialize pan-tilt camera controller (Pelco-D for movement)
         camera_control_method = self.config.get('CAMERA', 'camera_control_method', fallback='onvif')
         if camera_control_method == 'onvif' and ONVIF_AVAILABLE:
             onvif_ip = self.config.get('CAMERA', 'onvif_ip', fallback='192.168.1.68')
@@ -214,7 +244,7 @@ class LaserRangefinderApp(QMainWindow):
                 password=onvif_pass,
                 port=onvif_port
             )
-        elif camera_control_method == 'pelco_d' and UNIVERSAL_CAMERA_CONTROLLER_AVAILABLE:
+        elif camera_control_method == 'pelco_d' and ONVIF_AVAILABLE:
             pelco_d_ip = self.config.get('CAMERA', 'pelco_d_ip', fallback='192.168.1.120:80')
             self.camera_controller = UniversalCameraController(
                 control_method='pelco_d',
@@ -228,22 +258,9 @@ class LaserRangefinderApp(QMainWindow):
             else:
                 print(f"Failed to connect to camera via {camera_control_method}")
         
-        # Убираем отдельный контроллер поворотки, так как он теперь встроен в контроллер камеры
-        # self.pan_tilt_controller = None
-        # self.use_pan_tilt = self.config.getboolean('PAN_TILT', 'use_pan_tilt', fallback=False)
-        # if self.use_pan_tilt and PAN_TILT_AVAILABLE:
-        #     pan_tilt_host = self.config.get('PAN_TILT', 'host', fallback='192.168.1.115')
-        #     pan_tilt_port = self.config.getint('PAN_TILT', 'port', fallback=9760)
-        #     self.pan_tilt_controller = PanTiltController(pan_tilt_host, pan_tilt_port)
-        #     if self.pan_tilt_controller.connect():
-        #         print(f"Successfully connected to pan-tilt controller at {pan_tilt_host}:{pan_tilt_port}")
-        #     else:
-        #         print(f"Failed to connect to pan-tilt controller at {pan_tilt_host}:{pan_tilt_port}")
-        #         self.pan_tilt_controller = None  # Устанавливаем в None, если соединение не удалось
-
-        # Оставляем только флаг состояния соединения
-        self.connection_healthy = True  # Состояние соединения
-        self.continuous_measurements_active = False  # Флаг активности непрерывных измерений
+        # Connection health state
+        self.connection_healthy = True
+        self.continuous_measurements_active = False
         
         self._build_ui()
         self._update_connection_status()
@@ -548,20 +565,19 @@ class LaserRangefinderApp(QMainWindow):
         return grp
 
     def _on_camera_wheel(self, direction):
-        """Обработка события колеса мыши для зума камеры"""
-        if not self.camera_controller:
-            self.log_signal.emit("Camera controller not initialized")
+        """Mouse wheel zoom — uses separate ONVIF zoom controller (camera lens)."""
+        if not self.zoom_controller:
+            self.log_signal.emit("Zoom controller not initialized (ONVIF)")
             return
             
         try:
+            # Use continuous_move with short timeout for smooth incremental zoom
+            # Each wheel notch triggers a brief zoom burst, camera auto-stops after timeout
+            speed = 0.5
             if direction > 0:
-                # Вращение вперед - увеличение (zoom in)
-                self.camera_controller.zoom_in()
-                self.log_signal.emit("Zoom In via mouse wheel")
+                self.zoom_controller.continuous_move(z=speed, timeout=0.3)
             else:
-                # Вращение назад - уменьшение (zoom out)
-                self.camera_controller.zoom_out()
-                self.log_signal.emit("Zoom Out via mouse wheel")
+                self.zoom_controller.continuous_move(z=-speed, timeout=0.3)
         except Exception as e:
             self.log_signal.emit(f"Mouse wheel zoom failed: {e}")
 
@@ -709,15 +725,12 @@ class LaserRangefinderApp(QMainWindow):
                 try: tcp_port = int(self.tcp_port_input.text().strip())
                 except ValueError: QMessageBox.critical(self,"Error","Invalid TCP port."); return
                 self.tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                # Устанавливаем более длительный таймаут для TCP-соединения
                 self.tcp_socket.settimeout(10)
                 self.tcp_socket.connect((host, tcp_port))
                 self.protocol = TcpProtocolHandler(self.tcp_socket)
                 info = f"TCP {host}:{tcp_port}"
             
-            # Инициализируем состояние соединения при успешном подключении
             self.connection_healthy = True
-            
             self.is_connected = True
             self._update_connection_status()
             self.status_bar.showMessage(f"Connected: {info}")
@@ -725,18 +738,29 @@ class LaserRangefinderApp(QMainWindow):
             self._apply_target_mode()
         except Exception as e:
             QMessageBox.critical(self,"Connection Error", str(e))
-            for x in [self.tcp_socket, self.serial_conn]:
-                try: x and x.close()
-                except: pass
+            # Properly close protocol handler first, then underlying connections
+            if self.protocol:
+                try: self.protocol.close()
+                except Exception: pass
+            for x in [self.serial_conn, self.tcp_socket]:
+                try:
+                    if x: x.close()
+                except Exception: pass
             self.serial_conn = self.tcp_socket = self.protocol = None
             self.is_connected = False
             self.connection_healthy = False
 
     def _disconnect(self):
         if self.is_ranging: self._stop_continuous()
+        # Close protocol handler first (flushes any pending I/O)
+        if self.protocol:
+            try: self.protocol.close()
+            except Exception: pass
+        # Then close underlying connections
         for x in [self.serial_conn, self.tcp_socket]:
-            try: x and x.close()
-            except: pass
+            try:
+                if x: x.close()
+            except Exception: pass
         self.serial_conn = self.tcp_socket = self.protocol = None
         self.is_connected = False
         self.connection_healthy = False
@@ -789,71 +813,74 @@ class LaserRangefinderApp(QMainWindow):
     def _start_continuous(self):
         if not self.protocol: return
         ok = self.protocol.set_ranging_frequency(self.freq_spin.value())
-        self.log_signal.emit(f"Freq → {self.freq_spin.value()} Hz" + ("" if ok else " [FAILED]"))
+        self.log_signal.emit(f"Freq \u2192 {self.freq_spin.value()} Hz" + ("" if ok else " [FAILED]"))
         self.is_ranging = True
-        self.continuous_measurements_active = True  # Устанавливаем флаг активности непрерывных измерений
-        self.continuous_btn.setText("■  Stop Continuous")
+        self._is_ranging_event.set()  # Signal worker thread to run
+        self.continuous_measurements_active = True
+        self.continuous_btn.setText("\u25a0  Stop Continuous")
         self.continuous_btn.setObjectName("btn_cont_stop")
         self.continuous_btn.setStyle(self.continuous_btn.style())
         self.single_btn.setEnabled(False)
         self.progress_bar.setVisible(True)
         self.ranging_thread = threading.Thread(target=self._continuous_worker, daemon=True)
         self.ranging_thread.start()
-
+    
     def _stop_continuous(self):
         self.is_ranging = False
-        self.continuous_measurements_active = False  # Сбрасываем флаг активности непрерывных измерений
+        self._is_ranging_event.clear()  # Signal worker thread to stop
+        self.continuous_measurements_active = False
         if self.protocol:
             try: self.protocol.stop_ranging()
-            except: pass
+            except Exception: pass
         if self.ranging_thread and self.ranging_thread.is_alive():
-            self.ranging_thread.join(timeout=2)
+            self.ranging_thread.join(timeout=3)
         self.progress_bar.setVisible(False)
-        self.multi_targets.clear(); self.update_multi_signal.emit({})
+        with self._multi_targets_lock:
+            self.multi_targets.clear()
+        self.update_multi_signal.emit({})
         QTimer.singleShot(0, self._on_continuous_stopped)
-
+    
     def _on_continuous_stopped(self):
-        self.continuous_btn.setText("▶  Start Continuous")
+        self.continuous_btn.setText("\u25b6  Start Continuous")
         self.continuous_btn.setObjectName("btn_cont")
         self.continuous_btn.setStyle(self.continuous_btn.style())
         self.single_btn.setEnabled(self.is_connected)
         self.progress_bar.setVisible(False)
-
+    
     def _continuous_worker(self):
         if not self.protocol: return
         self.protocol.start_continuous_ranging()
-        errors = 0
-        consecutive_errors = 0  # Счетчик последовательных ошибок
-        max_consecutive_errors = 20  # Максимальное количество последовательных ошибок перед остановкой
-        
-        while self.is_ranging:
+        consecutive_errors = 0
+        max_consecutive_errors = 20
+            
+        while self._is_ranging_event.is_set():
             if not self.is_connected:
                 self.log_signal.emit("Connection lost"); break
             try:
-                raw = self.protocol.read_response(timeout=3.0)  # Увеличиваем таймаут для стабильности
+                raw = self.protocol.read_response(timeout=3.0)
                 if raw is None:
-                    errors += 1
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors: 
-                        self.log_signal.emit(f"Too many consecutive timeouts ({consecutive_errors}), stopping continuous measurement"); break
+                        self.log_signal.emit(f"Too many consecutive timeouts ({consecutive_errors}), stopping"); break
                     continue
                 parsed = self.protocol._parse_response(raw)
                 if not parsed: 
-                    errors += 1
                     consecutive_errors += 1
                     continue
-                errors = 0
-                consecutive_errors = 0  # Сброс последовательных ошибок при успешном ответе
-                
+                consecutive_errors = 0
+                    
                 cmd = parsed['command_code']
                 if cmd == CMD_CONTINUE_RANGING and len(parsed['params']) == 4:
                     r = decode_ranging_response(parsed['params'])
                     dist_str = f"{r['distance']:.1f}"
                     if r['is_multi_target']:
-                        self.multi_targets[r['target_number']] = r
-                        self.update_multi_signal.emit(dict(self.multi_targets))
+                        with self._multi_targets_lock:
+                            self.multi_targets[r['target_number']] = r
+                            snapshot = dict(self.multi_targets)
+                        self.update_multi_signal.emit(snapshot)
                     else:
-                        self.multi_targets.clear()
+                        with self._multi_targets_lock:
+                            self.multi_targets.clear()
                         self.update_multi_signal.emit({})
                         self.update_signal.emit(dist_str, r['status_description'])
                     self.log_signal.emit(f"Ranging: {dist_str} m  [{r['status_description']}]")
@@ -861,12 +888,13 @@ class LaserRangefinderApp(QMainWindow):
                     self.update_signal.emit("--", "Ranging Abnormal")
                     self.log_signal.emit("Ranging abnormal")
             except Exception as e:
-                self.log_signal.emit(f"Worker: {e}")
-                errors += 1
+                self.log_signal.emit(f"Worker error: {e}")
                 consecutive_errors += 1
                 if consecutive_errors >= max_consecutive_errors: 
-                    self.log_signal.emit(f"Too many consecutive errors ({consecutive_errors}), stopping continuous measurement"); break
+                    self.log_signal.emit(f"Too many consecutive errors ({consecutive_errors}), stopping"); break
+        # Thread-safe cleanup: signal main thread to update UI
         self.is_ranging = False
+        self._is_ranging_event.clear()
         self.continuous_measurements_active = False
         QTimer.singleShot(0, self._on_continuous_stopped)
 
@@ -898,25 +926,31 @@ class LaserRangefinderApp(QMainWindow):
         self.cam_btn.setText("■ Disconnect"); self.log_signal.emit(f"Camera: {url}")
 
     def _stop_camera(self):
-        if self.camera_thread: self.camera_thread.stop(); self.camera_thread = None
+        if self.camera_thread:
+            self.camera_thread.stop()
+            self.camera_thread = None
+        self._last_frame_rgb = None  # Release frame buffer memory
         self.cam_label.setText("Camera not connected")
-        self.cam_btn.setText("▶ Connect"); self.log_signal.emit("Camera disconnected")
+        self.cam_btn.setText("\u25b6 Connect"); self.log_signal.emit("Camera disconnected")
 
     def _on_camera_frame(self, frame: np.ndarray):
-        # Получаем размеры метки для отображения
+        # Get label dimensions for scaling
         lw = max(self.cam_label.width(),  320)
         lh = max(self.cam_label.height(), 240)
         fh, fw = frame.shape[:2]
         scale = min(lw/fw, lh/fh)
         nw, nh = int(fw*scale), int(fh*scale)
-        # Используем наиболее быструю интерполяцию для изменения размера
         frame_resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_NEAREST)
         rgb = cv2.cvtColor(frame_resized, cv2.COLOR_BGR2RGB)
-        # Создаем QImage напрямую из массива numpy для ускорения
+        
+        # CRITICAL: Store reference to prevent garbage collection while QImage uses it.
+        # QImage(rgb.data, ...) does NOT copy the buffer; if rgb is collected,
+        # the pixmap will show corrupted/garbage data.
+        self._last_frame_rgb = rgb
+        
         h, w, ch = rgb.shape
         bytes_per_line = ch * w
         q_img = QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-        # Обновляем pixmap напрямую без создания лишних объектов
         self.cam_label.setPixmap(QPixmap.fromImage(q_img))
 
     def _on_camera_error(self, msg):
@@ -1360,7 +1394,7 @@ class LaserRangefinderApp(QMainWindow):
                 self.ov_dist_slider.setValue(self.overlay.distance)
                 self.ov_dist_val.setText(f"{self.overlay.distance} m")
                 self.ov_dist_slider.blockSignals(False)
-            except: pass
+            except Exception: pass
         else:
             err = "out of range" in status_desc.lower() or "abnormal" in status_desc.lower()
             self.distance_label.setText(f"Distance: --  ({status_desc})")
@@ -1467,20 +1501,33 @@ class LaserRangefinderApp(QMainWindow):
             "PyQt5 · pySerial · OpenCV")
 
     def closeEvent(self, e):
-        if self.is_ranging: self._stop_continuous()
-        if self.is_connected: self._disconnect()
-        if self.camera_thread: self._stop_camera()
-        # Отключаем универсальный контроллер камеры при закрытии приложения
+        # Stop ranging first (signals worker thread to exit)
+        if self.is_ranging:
+            self._is_ranging_event.clear()
+            self._stop_continuous()
+        # Disconnect from rangefinder
+        if self.is_connected:
+            self._disconnect()
+        # Stop camera stream
+        if self.camera_thread:
+            self._stop_camera()
+        # Disconnect camera controller (pan-tilt)
         if self.camera_controller:
             try:
                 self.camera_controller.disconnect()
-            except:
+            except Exception:
                 pass
-        # Отключаем контроллер поворотки при закрытии приложения (если он был)
+        # Disconnect ONVIF zoom controller
+        if self.zoom_controller:
+            try:
+                self.zoom_controller.disconnect()
+            except Exception:
+                pass
+        # Disconnect legacy pan-tilt controller
         if hasattr(self, 'pan_tilt_controller') and self.pan_tilt_controller:
             try:
                 self.pan_tilt_controller.disconnect()
-            except:
+            except Exception:
                 pass
         e.accept()
 

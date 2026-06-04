@@ -184,6 +184,10 @@ class ProtocolHandlerBase:
         """Read exactly n bytes. Raise TimeoutError if not available in time."""
         raise NotImplementedError
 
+    def close(self):
+        """Close the underlying transport. Override in subclasses."""
+        pass
+
     # ------------------------------------------------------------------
     # Internal I/O
     # ------------------------------------------------------------------

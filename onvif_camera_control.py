@@ -55,7 +55,7 @@ class OnvifCameraController:
             return None
         try:
             return self.ptz_service.GetConfigurations()
-        except:
+        except Exception:
             return None
     
     def get_presets(self):
@@ -64,7 +64,7 @@ class OnvifCameraController:
             return None
         try:
             return self.ptz_service.GetPresets({'ProfileToken': self.profiles[0].token})
-        except:
+        except Exception:
             return None
     
     def absolute_move(self, x=None, y=None, z=None):
@@ -200,7 +200,7 @@ class PelcoDController:
         if self.tcp_socket:
             try:
                 self.tcp_socket.close()
-            except:
+            except OSError:
                 pass
             self.tcp_socket = None
     

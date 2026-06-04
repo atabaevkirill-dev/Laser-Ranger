@@ -1,6 +1,7 @@
 """
-Класс для управления повороткой по протоколу, описанному пользователем.
+Pan-tilt controller class using a custom TCP protocol.
 """
+import time
 import socket
 import re
 from typing import Tuple, Optional
@@ -234,21 +235,17 @@ class PanTiltController:
         return response is not None
 
     def move_pan_tilt(self, pan_speed: float, tilt_speed: float) -> bool:
-        """Одновременное движение по обеим осям"""
-        # Проверяем, заняты ли оси
+        """Simultaneous movement on both axes."""
         if self.is_pan_busy():
-            print("Ось поворота занята выполнением предыдущей команды")
+            print("Pan axis is busy")
             return False
             
         if self.is_tilt_busy():
-            print("Ось наклона занята выполнением предыдущей команды")
+            print("Tilt axis is busy")
             return False
             
-        # Отправляем команды последовательно, но с небольшой задержкой для надежности
         success_pan = self.move_pan(pan_speed)
-        # Задержка для обеспечения обработки первой команды
-        import time
-        time.sleep(0.05)  # 50 мс задержка
+        time.sleep(0.05)  # 50ms delay for command processing
         success_tilt = self.move_tilt(tilt_speed)
         return success_pan and success_tilt
 
